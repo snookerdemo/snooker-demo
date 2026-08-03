@@ -1,1 +1,2 @@
-# snooker-demo
+# g2snooker
+โปรแกรมโต๊ะสนุ๊ก
