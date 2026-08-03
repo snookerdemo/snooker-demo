@@ -1501,9 +1501,7 @@ function renderGrid(){
   grid.querySelectorAll('.order-mini[data-tid]').forEach(el=>{ _scrollMap[el.dataset.tid]=el.scrollTop; });
   grid.innerHTML='';
   const _ids=Object.keys(data).sort(function(a,b){
-    var na=parseInt(((data[a]&&data[a].name)||a).toString().replace(/\D/g,""))||0;
-    var nb=parseInt(((data[b]&&data[b].name)||b).toString().replace(/\D/g,""))||0;
-    return na-nb;
+    return (parseInt(a)||0)-(parseInt(b)||0);
   });
   for(let id of _ids){
     const t=data[id];let timeStr="00:00:00",minTxt="",costHtml="",trCost="";
