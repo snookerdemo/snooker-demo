@@ -223,6 +223,123 @@ def send_telegram_cancel(message):
 def send_telegram_stock(message):
     send_telegram(message, event_type='stock')
 
+# ── TELEGRAM NOTIFICATION CARD (รูปภาพ) ────────────────────────
+from io import BytesIO
+_FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'fonts')
+_F_REG = os.path.join(_FONT_DIR, 'Waree.ttf')
+_F_BOLD = os.path.join(_FONT_DIR, 'Waree-Bold.ttf')
+
+def _draw_badge(d, cx, cy, r, color, kind):
+    d.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
+    if kind == 'x':
+        o = r*0.42
+        d.line([(cx-o,cy-o),(cx+o,cy+o)], fill=(255,255,255), width=5)
+        d.line([(cx-o,cy+o),(cx+o,cy-o)], fill=(255,255,255), width=5)
+    elif kind == 'check':
+        d.line([(cx-r*0.45,cy+r*0.05),(cx-r*0.1,cy+r*0.4)], fill=(255,255,255), width=5)
+        d.line([(cx-r*0.1,cy+r*0.4),(cx+r*0.5,cy-r*0.35)], fill=(255,255,255), width=5)
+
+def render_notify_card(kind, title, accent, rows, time_str, subtitle=None, highlight_idx=None):
+    """สร้างรูปการ์ดแจ้งเตือนสวยๆ ธีมเดียวกับ G2 POS -> คืนค่าเป็น PNG bytes
+       kind: 'x' (ยกเลิก, สีแดง) หรือ 'check' (เช็คบิล, สีทอง)
+       rows: [(label, value), ...]"""
+    from PIL import Image, ImageDraw, ImageFont
+    W = 700; PAD = 40; header_h = 116; row_h = 54; footer_h = 60
+    n = len(rows)
+    H = header_h + PAD//2 + n*row_h + footer_h + 20
+    bg = (13, 13, 20)
+    header_bg = (22, 12, 12) if kind == 'x' else (10, 18, 15)
+    card = Image.new('RGB', (W, H), bg)
+    d = ImageDraw.Draw(card)
+
+    d.rectangle([0, 0, W, 6], fill=accent)
+    d.rectangle([0, 6, W, header_h], fill=header_bg)
+    _draw_badge(d, PAD+26, header_h//2+3, 26, accent, kind)
+
+    f_title = ImageFont.truetype(_F_BOLD, 34)
+    f_sub = ImageFont.truetype(_F_REG, 19)
+    d.text((PAD+64, 30), title, font=f_title, fill=(255,255,255))
+    if subtitle:
+        d.text((PAD+64, 74), subtitle, font=f_sub, fill=tuple(min(255,c+70) for c in accent))
+    d.line([(0,header_h),(W,header_h)], fill=accent, width=2)
+
+    f_label = ImageFont.truetype(_F_REG, 24)
+    f_value = ImageFont.truetype(_F_BOLD, 24)
+    f_value_big = ImageFont.truetype(_F_BOLD, 34)
+
+    y = header_h + PAD//2
+    for i, (label, value) in enumerate(rows):
+        is_hi = (highlight_idx is not None and i == highlight_idx)
+        vf = f_value_big if is_hi else f_value
+        d.text((PAD, y+8), str(label), font=f_label, fill=(145,145,160))
+        val = str(value)
+        bbox = d.textbbox((0,0), val, font=vf)
+        vw = bbox[2]-bbox[0]
+        vcolor = accent if is_hi else (235,235,240)
+        d.text((W-PAD-vw, y), val, font=vf, fill=vcolor)
+        y += row_h
+        if i < n-1:
+            d.line([(PAD,y-8),(W-PAD,y-8)], fill=(32,32,42), width=1)
+
+    d.line([(PAD,H-footer_h),(W-PAD,H-footer_h)], fill=(32,32,42), width=1)
+    f_foot = ImageFont.truetype(_F_REG, 18)
+    d.text((PAD, H-footer_h+18), f"เวลา {time_str}", font=f_foot, fill=(115,115,130))
+    brand = "G2 SNOOKER"
+    bbox = d.textbbox((0,0), brand, font=f_foot)
+    bw = bbox[2]-bbox[0]
+    d.text((W-PAD-bw, H-footer_h+18), brand, font=f_foot, fill=tuple(min(255,c+40) for c in accent))
+
+    buf = BytesIO()
+    card.save(buf, format='PNG')
+    return buf.getvalue()
+
+def _tg_send_photo_to(token, chat_id, image_bytes, caption=''):
+    try:
+        boundary = '----G2SnookerBoundary7d9f2a'
+        parts = []
+        def field(name, value):
+            parts.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode('utf-8')
+            )
+        field('chat_id', chat_id)
+        if caption:
+            field('caption', caption)
+            field('parse_mode', 'HTML')
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="notify.png"\r\nContent-Type: image/png\r\n\r\n'.encode('utf-8')
+        )
+        parts.append(image_bytes)
+        parts.append(f'\r\n--{boundary}--\r\n'.encode('utf-8'))
+        body = b''.join(parts)
+        url = f"https://api.telegram.org/bot{token}/sendPhoto"
+        req = urllib.request.Request(url, data=body, headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
+        urllib.request.urlopen(req, timeout=8)
+        return True
+    except Exception as e:
+        print(f"[WARN] Telegram sendPhoto {chat_id}: {e}")
+        return False
+
+def send_telegram_image(image_bytes, caption, event_type='checkout'):
+    token, rooms = _get_tg_rooms(event_type)
+    if not token: return False
+    sent_any = False
+    targets = []
+    if rooms:
+        targets = [r['chat_id'] for r in rooms if r.get('chat_id','').strip()]
+    else:
+        try:
+            conn = get_db_connection()
+            cid = conn.execute("SELECT setting_value FROM system_settings WHERE setting_key='telegram_chat_id'").fetchone()
+            conn.close()
+            if cid and cid['setting_value']:
+                targets = [cid['setting_value']]
+        except Exception:
+            pass
+    for cid in targets:
+        if _tg_send_photo_to(token, cid, image_bytes, caption):
+            sent_any = True
+    return sent_any
+
 def send_line(message):
     _send_line_raw([{"type":"text","text":message}])
 
@@ -873,7 +990,18 @@ def table_action():
         active_sessions.pop(src); delete_session(src)
         send_relay(src, 'off')
         now_th = (datetime.now() + TZ_OFFSET).strftime('%H:%M')
-        send_telegram_cancel(f"🚫 <b>ยกเลิกโต๊ะ</b>\nโต๊ะ: {tab_name}\nรายการ: {detail}\nพนักงาน: {cashier}\nเวลา: {now_th}")
+        try:
+            _card_rows = [("โต๊ะ", tab_name), ("รายการ", detail), ("พนักงาน", cashier)]
+            if reason:
+                _card_rows.append(("เหตุผล", reason))
+            _card_img = render_notify_card('x', 'ยกเลิกโต๊ะ', (224,64,64), _card_rows, now_th,
+                                            subtitle='แจ้งเตือนการยกเลิก')
+            ok_img = send_telegram_image(_card_img, '', event_type='cancel')
+        except Exception as _ie:
+            print(f"[WARN] telegram cancel card: {_ie}")
+            ok_img = False
+        if not ok_img:
+            send_telegram_cancel(f"🚫 <b>ยกเลิกโต๊ะ</b>\nโต๊ะ: {tab_name}\nรายการ: {detail}\nพนักงาน: {cashier}\nเวลา: {now_th}")
         send_line_cancel_flex("ยกเลิกโต๊ะ", tab_name, detail, cashier, now_th, reason)
         return jsonify({"status":"success"})
     elif action=='move' and src in active_sessions and dst not in active_sessions:
@@ -993,7 +1121,24 @@ def checkout():
                + f"{pay_icon} <b>รวมสุทธิ: {total:,} ฿</b>\n"
                f"ช่องทาง: {payment_method}\n"
                f"พนักงาน: {cashier}")
-        send_telegram(msg, event_type='checkout')
+        try:
+            _time_range_img = f"{th_start} - {th_end}" + (f" ({hh} ชม. {mm} นาที)" if hh > 0 else f" ({mm} นาที)")
+            _rows_img = [("โต๊ะ", ti['name']), ("เวลา", _time_range_img),
+                         ("ค่าโต๊ะ", f"{fee:,.2f} ฿"), ("ค่าอาหาร", f"{sess['total_food']:,.2f} ฿")]
+            if bill_discount > 0:
+                _rows_img.append(("ส่วนลด", f"-{bill_discount:,.2f} ฿"))
+            _total_idx = len(_rows_img)
+            _rows_img.append(("รวมสุทธิ", f"{total:,} ฿"))
+            _rows_img.append(("ช่องทาง", payment_method))
+            _rows_img.append(("พนักงาน", cashier))
+            _card_img = render_notify_card('check', 'เช็คบิล', (212,175,55), _rows_img, th_end,
+                                            subtitle='G2 SNOOKER — บิลชำระแล้ว', highlight_idx=_total_idx)
+            ok_img = send_telegram_image(_card_img, '', event_type='checkout')
+        except Exception as _ie:
+            print(f"[WARN] telegram checkout card: {_ie}")
+            ok_img = False
+        if not ok_img:
+            send_telegram(msg, event_type='checkout')
         send_line_bill({
             "bill_no": bno, "table_name": ti['name'],
             "time_range": f"{th_start} → {th_end}" + (f" ({hh} ชม. {mm} นาที)" if hh > 0 else f" ({mm} นาที)"),
@@ -1470,16 +1615,6 @@ def edit_table_name(tid):
     return jsonify({"status":"success"})
 
 # ── RELAY CONTROL (ESP8266) ───────────────────────────────────
-import urllib.request as _ureq
-
-def _get_esp_url():
-    try:
-        conn = get_db_connection()
-        r = conn.execute("SELECT setting_value FROM system_settings WHERE setting_key='esp8266_url'").fetchone()
-        conn.close()
-        return r['setting_value'].strip() if r and r['setting_value'] else None
-    except: return None
-
 def send_relay(table_number, state):
     """ส่งคำสั่งเปิด/ปิดไฟโต๊ะผ่าน MQTT (HiveMQ Cloud)"""
     try:
@@ -1501,19 +1636,6 @@ def send_relay(table_number, state):
         err_msg = f"{type(e).__name__}: {e}"
         print(f"[WARN] Relay MQTT table {table_number}: {err_msg}")
         return False, err_msg
-
-@app.route("/api/relay/test", methods=["POST"])
-def relay_test():
-    url = _get_esp_url()
-    if not url:
-        return jsonify({"status":"error","msg":"ยังไม่ได้ตั้งค่า ESP8266 URL"}),400
-    try:
-        req = _ureq.Request(f"{url}/status")
-        res = _ureq.urlopen(req, timeout=3)
-        data = json.loads(res.read())
-        return jsonify({"status":"success","relay_status":data})
-    except Exception as e:
-        return jsonify({"status":"error","msg":str(e)}),500
 
 @app.route("/api/relay/control", methods=["POST"])
 def relay_control():

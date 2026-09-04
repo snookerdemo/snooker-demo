@@ -1060,21 +1060,11 @@ function setTheme(name){
 
       <div class="card-panel mb-4" style="border-left:4px solid #f59e0b">
         <h6 class="text-warning mb-3"><i class="fa-solid fa-plug me-2"></i>ระบบควบคุมไฟโต๊ะ (ESP8266)</h6>
-        <p class="text-muted small mb-3">เมื่อเปิดโต๊ะ → ไฟติด | เมื่อเช็คบิล/ยกเลิก → ไฟดับ อัตโนมัติ</p>
-        <div class="row g-3 mb-3">
-          <div class="col-md-7">
-            <label class="text-muted small">ESP8266 URL (IP ในวง LAN เดียวกัน)</label>
-            <input type="text" id="set-esp-url" class="form-control custom-input" placeholder="http://192.168.1.200">
-          </div>
-          <div class="col-md-3 d-flex align-items-end">
-            <button class="btn w-100 fw-bold" style="background:#f59e0b;color:white;border:none" onclick="testRelay()">🔌 ทดสอบ</button>
-          </div>
-        </div>
+        <p class="text-muted small mb-3">เมื่อเปิดโต๊ะ → ไฟติด | เมื่อเช็คบิล/ยกเลิก → ไฟดับ อัตโนมัติ (ควบคุมผ่าน MQTT ไม่ต้องตั้งค่า IP)</p>
         <div class="d-flex gap-2 flex-wrap mb-2">
           <button class="btn btn-success btn-sm fw-bold" onclick="controlAllRelay('on')">💡 เปิดไฟทุกโต๊ะ</button>
           <button class="btn btn-secondary btn-sm fw-bold" onclick="controlAllRelay('off')">🌑 ปิดไฟทุกโต๊ะ</button>
         </div>
-        <button class="btn fw-bold px-4 mt-2" style="background:#f59e0b;color:white;border:none" onclick="saveEspUrl()"><i class="fa-solid fa-floppy-disk me-2"></i>บันทึก URL</button>
       </div>
 
       <div class="card-panel mb-4" style="border-left:4px solid #229ed9">
@@ -2792,9 +2782,7 @@ async function loadSettings(){
   const rs=await fetch('/api/settings');const s=await rs.json();
   document.getElementById('set-cutoff').value=s.day_cutoff_time||"06:00";
   document.getElementById('set-cash').value=s.starting_cash||2000;
-  // โหลด ESP8266 URL
-  if(document.getElementById('set-esp-url')) document.getElementById('set-esp-url').value=s.esp8266_url||'';
-  
+
   // บอทเช็คอินเข้างาน
   if(document.getElementById('set-line-checkin-token')) document.getElementById('set-line-checkin-token').value=s.line_checkin_token||'';
   if(document.getElementById('set-line-checkin-groupid')) document.getElementById('set-line-checkin-groupid').value=s.line_checkin_group_id||'';
@@ -2993,21 +2981,6 @@ async function deleteFoodTable(id,name){
   const d=await r.json();
   if(r.ok){loadTableConfig();updateGrid();}
   else alert('❌ '+d.msg);
-}
-async function saveEspUrl(){
-  const url=document.getElementById('set-esp-url').value.trim();
-  await fetch('/api/settings?cashier='+encodeURIComponent(currentUser),{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({esp8266_url:url})});
-  alert('✅ บันทึก URL สำเร็จ');
-}
-async function testRelay(){
-  await saveEspUrl();
-  const r=await fetch('/api/relay/test',{method:'POST'});
-  const d=await r.json();
-  if(r.ok && d.status==='success'){
-    const status=Object.entries(d.relay_status).map(([k,v])=>`${k}: ${v?'🟢เปิด':'⚫ปิด'}`).join(' | ');
-    alert('✅ เชื่อมต่อสำเร็จ!\n'+status);
-  } else alert('❌ เชื่อมต่อไม่ได้: '+(d.msg||'ตรวจสอบ URL และ WiFi'));
 }
 async function controlAllRelay(state){
   const r=await fetch('/api/relay/control',{method:'POST',headers:{'Content-Type':'application/json'},
