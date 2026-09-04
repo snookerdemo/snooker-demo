@@ -716,9 +716,23 @@ def _demo_auto_reset_loop():
             print(f"[demo-auto-reset] {e}")
         _time.sleep(600)  # เช็คทุก 10 นาที
 
+def _become_demo_reset_leader():
+    """gunicorn มักรัน worker process หลายตัว แต่ละตัว import app.py แยกกัน — ถ้าปล่อยให้
+    ทุก worker รันเธรด auto-reset เอง จะแย่งกันเขียน sqlite พร้อมกันจนเกิด 'database is locked'
+    ใช้ file lock ระดับ OS ให้ worker แรกที่คว้าล็อกได้เท่านั้นเป็นคนรันเธรดนี้"""
+    try:
+        import fcntl
+        lf = open('/tmp/demo_auto_reset.lock', 'w')
+        fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lf  # เก็บ reference ไว้ตลอดอายุโปรเซส ไม่งั้น GC จะปล่อยล็อก
+    except Exception:
+        return None
+
 if DEMO_MODE:
     import threading as _threading
-    _threading.Thread(target=_demo_auto_reset_loop, daemon=True).start()
+    _demo_lock_fh = _become_demo_reset_leader()
+    if _demo_lock_fh:
+        _threading.Thread(target=_demo_auto_reset_loop, daemon=True).start()
 
 # ── PERMISSIONS ───────────────────────────────────────────────
 @app.route("/api/permissions/list")

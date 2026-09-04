@@ -111,8 +111,15 @@ def get_db_connection():
         import psycopg2
         raw = psycopg2.connect(DATABASE_URL, connect_timeout=5)
         return Conn(raw, True)
-    raw = sqlite3.connect('g2snooker.db')
+    # timeout สูงขึ้น + WAL mode กัน "database is locked" เวลามีหลาย worker/thread
+    # เข้าถึงไฟล์ sqlite พร้อมกัน (เช่น เธรด auto-reset ของโหมดเดโมกับ request ปกติ)
+    raw = sqlite3.connect('g2snooker.db', timeout=30)
     raw.row_factory = sqlite3.Row
+    try:
+        raw.execute('PRAGMA journal_mode=WAL')
+        raw.execute('PRAGMA busy_timeout=30000')
+    except Exception:
+        pass
     return Conn(raw, False)
 
 # ─── init_db ─────────────────────────────────────────────────
