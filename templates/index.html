@@ -997,12 +997,17 @@ function setTheme(name){
     <div class="card-panel mb-4" style="border-left:4px solid var(--cyan)">
       <div class="card-panel mb-4" style="border-left:4px solid #f59e0b">
         <div class="d-flex justify-content-between align-items-center mb-3">
-          <h6 class="text-warning mb-0"><i class="fa-solid fa-table me-2"></i>จัดการโต๊ะ (เพิ่ม/ลบ โต๊ะอาหาร/อื่นๆ)</h6>
+          <h6 class="text-warning mb-0"><i class="fa-solid fa-table me-2"></i>จัดการโต๊ะ (เพิ่ม/ลบ โต๊ะสนุ๊กเกอร์/อาหาร/อื่นๆ)</h6>
         </div>
         <div class="d-flex gap-2 mb-3">
           <input type="text" id="new-table-name" class="form-control custom-input" placeholder="ชื่อโต๊ะใหม่ เช่น โต๊ะ VIP, โต๊ะ 11">
+          <select id="new-table-type" class="form-select custom-input" style="max-width:160px">
+            <option value="snooker">🎱 สนุ๊กเกอร์ (คิดเวลา)</option>
+            <option value="food">🍔 อาหาร/อื่นๆ</option>
+          </select>
           <button class="btn btn-success fw-bold px-4" onclick="addFoodTable()"><i class="fa-solid fa-plus me-1"></i>เพิ่ม</button>
         </div>
+        <div class="small text-muted mb-2">โต๊ะสนุ๊กเกอร์คิดค่าบริการตามเรทเวลาที่ตั้งไว้ในหัวข้อ "ตั้งค่าเรทเวลา" ด้านล่าง ไม่ต้องตั้งราคาแยกต่อโต๊ะ</div>
         <table class="table table-premium text-center mb-0">
           <thead><tr><th>ชื่อโต๊ะ</th><th>ประเภท</th><th></th></tr></thead>
           <tbody id="table-config-body"></tbody>
@@ -2953,7 +2958,7 @@ function renderTableConfig(){
       <button class="btn btn-sm" style="background:#334155;color:white;border:none" ${idx===d.length-1?'disabled':''} onclick="moveTableConfig(${idx},1)" title="เลื่อนลง">⬇️</button>
       <button class="btn btn-sm fw-bold" id="tedit-btn-${t.id}" style="background:#0ea5e9;color:white;border:none" onclick="startEditTable(${t.id})">✏️</button>
       <button class="btn btn-sm fw-bold d-none" id="tsave-btn-${t.id}" style="background:#10b981;color:white;border:none" onclick="saveTableName(${t.id})">💾</button>
-      ${t.type!=='snooker'?`<button class="btn btn-sm fw-bold" style="background:#ef4444;color:white;border:none" onclick="deleteFoodTable(${t.id},'${t.name}')">🗑</button>`:''}
+      <button class="btn btn-sm fw-bold" style="background:#ef4444;color:white;border:none" onclick="deleteFoodTable(${t.id},'${t.name}')">🗑</button>
     </td>
   </tr>`).join('');
 }
@@ -2970,9 +2975,10 @@ async function moveTableConfig(idx, dir){
 }
 async function addFoodTable(){
   const name=document.getElementById('new-table-name').value.trim();
+  const type=document.getElementById('new-table-type')?.value||'food';
   if(!name){alert('กรุณาใส่ชื่อโต๊ะ');return;}
   const r=await fetch('/api/tables_config',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({name})});
+    body:JSON.stringify({name,type})});
   if(r.ok){
     document.getElementById('new-table-name').value='';
     loadTableConfig();

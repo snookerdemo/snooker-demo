@@ -1261,9 +1261,12 @@ def manage_tables_config():
     if request.method == "POST":
         d = request.json
         name = d.get("name","").strip()
+        ttype = d.get("type","food")
+        if ttype not in ("snooker","food"):
+            ttype = "food"
         if not name:
             conn.close(); return jsonify({"status":"error","msg":"กรุณาใส่ชื่อโต๊ะ"}),400
-        conn.execute("INSERT INTO tables_config (name,type,rate_1) VALUES (?,?,?)", (name, "food", 0.0))
+        conn.execute("INSERT INTO tables_config (name,type,rate_1) VALUES (?,?,?)", (name, ttype, 0.0))
         conn.commit(); conn.close()
         return jsonify({"status":"success"})
     if request.method == "DELETE":
@@ -1271,8 +1274,6 @@ def manage_tables_config():
         t = conn.execute("SELECT type FROM tables_config WHERE id=?", (tid,)).fetchone()
         if not t:
             conn.close(); return jsonify({"status":"error","msg":"ไม่พบโต๊ะ"}),404
-        if t["type"] == "snooker":
-            conn.close(); return jsonify({"status":"error","msg":"ไม่สามารถลบโต๊ะสนุ๊กเกอร์ได้"}),400
         conn.execute("DELETE FROM tables_config WHERE id=?", (tid,))
         conn.commit(); conn.close()
         return jsonify({"status":"success"})
