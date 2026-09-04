@@ -178,8 +178,10 @@ def _tg_send_to(token, chat_id, message):
         data = json.dumps({"chat_id": chat_id, "text": message, "parse_mode": "HTML"}).encode()
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=5)
+        return True
     except Exception as e:
         print(f"[WARN] Telegram send {chat_id}: {e}")
+        return False
 
 def _get_tg_rooms(event_type):
     try:
@@ -190,7 +192,7 @@ def _get_tg_rooms(event_type):
         token = tok['setting_value'].strip() if tok and tok['setting_value'] else ''
         if not token: return token, []
         rooms = json.loads(rooms_raw['setting_value']) if rooms_raw and rooms_raw['setting_value'] else []
-        matched = [r for r in rooms if r.get(event_type)]
+        matched = [r for r in rooms if r.get('notify_' + event_type)]
         return token, matched
     except Exception as e:
         print(f"[WARN] get_tg_rooms: {e}")
@@ -198,19 +200,22 @@ def _get_tg_rooms(event_type):
 
 def send_telegram(message, event_type='checkout'):
     token, rooms = _get_tg_rooms(event_type)
-    if not token: return
+    if not token: return False
+    sent_any = False
     if not rooms:
         try:
             conn = get_db_connection()
             cid = conn.execute("SELECT setting_value FROM system_settings WHERE setting_key='telegram_chat_id'").fetchone()
             conn.close()
             if cid and cid['setting_value']:
-                _tg_send_to(token, cid['setting_value'], message)
+                sent_any = _tg_send_to(token, cid['setting_value'], message)
         except: pass
-        return
+        return sent_any
     for r in rooms:
         if r.get('chat_id','').strip():
-            _tg_send_to(token, r['chat_id'], message)
+            if _tg_send_to(token, r['chat_id'], message):
+                sent_any = True
+    return sent_any
 
 def send_telegram_cancel(message):
     send_telegram(message, event_type='cancel')
@@ -1245,8 +1250,44 @@ def line_test():
 @app.route("/api/telegram/test", methods=["POST"])
 def telegram_test():
     try:
-        send_telegram("✅ <b>G2 SNOOKER</b> — ทดสอบการแจ้งเตือน Telegram สำเร็จ!")
-        return jsonify({"status":"success"})
+        conn = get_db_connection()
+        tok = conn.execute("SELECT setting_value FROM system_settings WHERE setting_key='telegram_token'").fetchone()
+        rooms_raw = conn.execute("SELECT setting_value FROM system_settings WHERE setting_key='telegram_rooms'").fetchone()
+        conn.close()
+        token = tok['setting_value'].strip() if tok and tok['setting_value'] else ''
+        if not token:
+            return jsonify({"status":"error","msg":"ยังไม่ได้กรอก Bot Token"}), 400
+        rooms = json.loads(rooms_raw['setting_value']) if rooms_raw and rooms_raw['setting_value'] else []
+        msg = "✅ <b>G2 SNOOKER</b> — ทดสอบการแจ้งเตือน Telegram สำเร็จ!"
+        sent, failed = [], []
+        if rooms:
+            for r in rooms:
+                cid = r.get('chat_id','').strip()
+                name = r.get('name') or cid or '(ไม่มีชื่อ)'
+                if not cid:
+                    failed.append(f"{name} (ยังไม่ได้กรอก Chat ID)")
+                    continue
+                if _tg_send_to(token, cid, msg):
+                    sent.append(name)
+                else:
+                    failed.append(name)
+        else:
+            conn2 = get_db_connection()
+            cid_row = conn2.execute("SELECT setting_value FROM system_settings WHERE setting_key='telegram_chat_id'").fetchone()
+            conn2.close()
+            cid = cid_row['setting_value'].strip() if cid_row and cid_row['setting_value'] else ''
+            if not cid:
+                return jsonify({"status":"error","msg":"ยังไม่มีห้อง/กลุ่มที่ตั้งค่า Chat ID ไว้"}), 400
+            if _tg_send_to(token, cid, msg):
+                sent.append(cid)
+            else:
+                failed.append(cid)
+        if not sent:
+            return jsonify({"status":"error","msg":"ส่งไม่สำเร็จทุกห้อง: " + ", ".join(failed)}), 500
+        result_msg = f"ส่งสำเร็จ {len(sent)} ห้อง: " + ", ".join(sent)
+        if failed:
+            result_msg += f" | ส่งไม่สำเร็จ: " + ", ".join(failed)
+        return jsonify({"status":"success","msg":result_msg})
     except Exception as e:
         return jsonify({"status":"error","msg":str(e)}),500
 

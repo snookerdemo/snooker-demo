@@ -3096,7 +3096,7 @@ async function testTelegram(){
   await saveTelegramSettings();
   const r=await fetch('/api/telegram/test',{method:'POST'});
   const d=await r.json();
-  if(r.ok && d.status==='success') alert('✅ ส่งข้อความทดสอบสำเร็จ!');
+  if(r.ok && d.status==='success') alert('✅ '+(d.msg||'ส่งข้อความทดสอบสำเร็จ!'));
   else alert('❌ '+(d.msg||'ตรวจสอบ Token และ Chat ID'));
 }
 
