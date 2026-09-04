@@ -1,7 +1,7 @@
 from flask import Flask, render_template, jsonify, request
 from database import get_db_connection, ALL_PERMISSIONS, SUPER_ROLES, init_db, IS_PG
 from datetime import datetime, timedelta, timezone
-import math, json, os
+import math, json, os, threading
 
 TZ_OFFSET = timedelta(hours=7)  # UTC+7 Thailand
 
@@ -477,6 +477,78 @@ def delete_session(table_id):
     conn.execute("DELETE FROM active_sessions_db WHERE table_id=?", (table_id,))
     conn.commit(); conn.close()
 
+_session_gen_counter = 0
+def next_gen():
+    global _session_gen_counter
+    _session_gen_counter += 1
+    return _session_gen_counter
+def trace_session(table_id, event, gen, session_start, detail=''):
+    # *** DEBUG: log ติดตาม session สำหรับหาบั๊กเวลาโต๊ะไม่ตัดตอนยกเลิก-เปิดใหม่เร็ว ***
+    try:
+        conn = get_db_connection()
+        if IS_PG:
+            conn.execute("CREATE TABLE IF NOT EXISTS session_trace (id SERIAL PRIMARY KEY, table_id INTEGER, event TEXT, gen INTEGER, session_start TEXT, wall_time TEXT, detail TEXT)")
+        else:
+            conn.execute("CREATE TABLE IF NOT EXISTS session_trace (id INTEGER PRIMARY KEY, table_id INTEGER, event TEXT, gen INTEGER, session_start TEXT, wall_time TEXT, detail TEXT)")
+        conn.execute("INSERT INTO session_trace (table_id,event,gen,session_start,wall_time,detail) VALUES (?,?,?,?,?,?)",
+            (table_id, event, gen, session_start, datetime.now().isoformat(), detail))
+        conn.commit(); conn.close()
+    except Exception as te:
+        print(f"[TRACE ERR] {te}")
+    print(f"[SESSION-TRACE] table={table_id} event={event} gen={gen} start={session_start} detail={detail}")
+
+@app.route("/api/session_trace/clear", methods=["POST"])
+def clear_session_trace():
+    # *** ล้างข้อมูล session_trace ทั้งหมด ใช้ครั้งเดียวตามคำขอ 23 ส.ค. 2569 ***
+    conn = get_db_connection()
+    try:
+        count_before = conn.execute("SELECT COUNT(*) as c FROM session_trace").fetchone()['c']
+        conn.execute("DELETE FROM session_trace")
+        conn.commit()
+        return jsonify({"status":"success","deleted":count_before})
+    except Exception as e:
+        return jsonify({"status":"error","msg":str(e)}),500
+    finally:
+        conn.close()
+
+@app.route("/api/session_trace", methods=["GET"])
+def get_session_trace():
+    # *** DEBUG: endpoint ดูประวัติ session_trace เฉพาะ owner (เช็คสิทธิ์ฝั่ง frontend) ***
+    conn = get_db_connection()
+    try:
+        start = request.args.get('start', '').strip()
+        end = request.args.get('end', '').strip()
+        q = "SELECT * FROM session_trace WHERE 1=1"
+        p = []
+        if start:
+            start_dt = datetime.fromisoformat(start + "T00:00:00") - TZ_OFFSET
+            q += " AND wall_time >= ?"
+            p.append(start_dt.isoformat())
+        if end:
+            end_dt = datetime.fromisoformat(end + "T23:59:59") - TZ_OFFSET
+            q += " AND wall_time <= ?"
+            p.append(end_dt.isoformat())
+        q += " ORDER BY id DESC LIMIT 300"
+        rows = conn.execute(q, p).fetchall()
+        result = [dict(r) for r in rows]
+        name_rows = conn.execute("SELECT id,name FROM tables_config").fetchall()
+        name_map = {int(r['id']): r['name'] for r in name_rows}
+        for r in result:
+            try:
+                r['table_name'] = name_map.get(int(r['table_id']), f"โต๊ะ {r['table_id']}")
+            except (TypeError, ValueError):
+                r['table_name'] = f"โต๊ะ {r['table_id']}"
+            for k in ('wall_time', 'session_start'):
+                if r.get(k):
+                    try:
+                        r[k] = (datetime.fromisoformat(r[k]) + TZ_OFFSET).isoformat()
+                    except Exception:
+                        pass
+    except Exception as e:
+        result = []
+    conn.close()
+    return jsonify(result)
+
 active_sessions = {}
 _initialized = False
 
@@ -585,11 +657,14 @@ def login():
     return jsonify({"status":"success","name":user['name'],"role":user['role'],"emp_id":user['id'],"permissions":perms})
 
 # ── DEMO (ทำงานเฉพาะตอนตั้ง ENV DEMO_MODE=true บนเซิร์ฟเวอร์เดโม่เท่านั้น) ──
+# หน้าตานี้ sync มาจากโค้ด g2snooker (ร้านจริง) ทั้งหมด ต่างกันแค่ seed_demo.py
+# ที่เติมแค่บัญชีเจ้าของร้าน 1 บัญชี ไม่มีโต๊ะ/ราคา/เมนู/พนักงานล่วงหน้า ให้ลูกค้าเพิ่มเอง
 DEMO_MODE = os.environ.get('DEMO_MODE','').lower() in ('1','true','yes')
+DEMO_AUTO_RESET_HOURS = float(os.environ.get('DEMO_AUTO_RESET_HOURS', '3'))
 
 @app.route("/api/demo/is_demo")
 def demo_is_demo():
-    return jsonify({"demo_mode": DEMO_MODE})
+    return jsonify({"demo_mode": DEMO_MODE, "auto_reset_hours": DEMO_AUTO_RESET_HOURS})
 
 @app.route("/api/demo/reset", methods=["POST"])
 def demo_reset():
@@ -598,9 +673,52 @@ def demo_reset():
     try:
         import seed_demo
         seed_demo.seed(reset=True, verbose=False)
-        return jsonify({"status":"success","msg":"รีเซ็ตข้อมูลเดโม่เรียบร้อย"})
+        _demo_mark_reset_now()
+        return jsonify({"status":"success","msg":"รีเซ็ตข้อมูลเดโม่เรียบร้อย — กลับเป็นหน้าโล่งเหมือนร้านใหม่"})
     except Exception as e:
         return jsonify({"status":"error","msg":str(e)}), 500
+
+def _demo_mark_reset_now():
+    """บันทึกเวลารีเซ็ตล่าสุดลง system_settings เพื่อใช้กะจังหวะ auto-reset"""
+    conn = get_db_connection()
+    now_iso = datetime.now().isoformat()
+    conn.execute(
+        "INSERT INTO system_settings (setting_key,setting_value) VALUES ('demo_last_reset',?) "
+        "ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value"
+        if IS_PG else
+        "INSERT OR REPLACE INTO system_settings (setting_key,setting_value) VALUES ('demo_last_reset',?)",
+        (now_iso,),
+    )
+    conn.commit()
+    conn.close()
+
+def _demo_auto_reset_loop():
+    """เธรดพื้นหลัง: เดโมสาธารณะให้หลายคนลองพร้อมกันได้ กันข้อมูลรกจนใช้ไม่ได้
+    เช็คทุก 10 นาทีว่าเลย DEMO_AUTO_RESET_HOURS จากรีเซ็ตล่าสุดหรือยัง ถ้าเลยก็รีเซ็ตให้อัตโนมัติ
+    เช็คเวลาจาก DB (ไม่ใช่ตัวแปรในโปรเซส) กันรีเซ็ตซ้ำซ้อนเวลามีหลาย worker"""
+    import time as _time
+    try:
+        init_db()  # กันเคสตารางยังไม่ถูกสร้างตอนแอปเพิ่งบูตรอบแรก
+    except Exception as e:
+        print(f"[demo-auto-reset] init_db warmup: {e}")
+    while True:
+        try:
+            conn = get_db_connection()
+            row = conn.execute("SELECT setting_value FROM system_settings WHERE setting_key='demo_last_reset'").fetchone()
+            conn.close()
+            last = datetime.fromisoformat(row['setting_value']) if row and row['setting_value'] else None
+            due = (last is None) or (datetime.now() - last >= timedelta(hours=DEMO_AUTO_RESET_HOURS))
+            if due:
+                import seed_demo
+                seed_demo.seed(reset=True, verbose=False)
+                _demo_mark_reset_now()
+        except Exception as e:
+            print(f"[demo-auto-reset] {e}")
+        _time.sleep(600)  # เช็คทุก 10 นาที
+
+if DEMO_MODE:
+    import threading as _threading
+    _threading.Thread(target=_demo_auto_reset_loop, daemon=True).start()
 
 # ── PERMISSIONS ───────────────────────────────────────────────
 @app.route("/api/permissions/list")
@@ -624,7 +742,7 @@ def manage_permissions():
 def get_tables():
     try:
         conn  = get_db_connection()
-        tabs  = conn.execute("SELECT * FROM tables_config").fetchall()
+        tabs  = conn.execute("SELECT * FROM tables_config ORDER BY id").fetchall()
         rates = conn.execute("SELECT * FROM rate_settings").fetchall()
         try:
             discounts = conn.execute("SELECT * FROM discount_periods ORDER BY id").fetchall()
@@ -645,7 +763,7 @@ def get_tables():
                 cap=s['start']+timedelta(minutes=s['limit_mins'])
                 if now>cap: now=cap
             fee = calc_fee(s['start'], now, rates, discounts, s.get('price_mode'))
-        res[tid]={"id":tid,"name":t['name'],"type":t['type'],"active":s['active'],"orders":s['orders'],
+        res[tid]={"id":tid,"name":t['name'],"type":t['type'],"sort_order":t['sort_order'] if 'sort_order' in t.keys() else tid,"active":s['active'],"orders":s['orders'],
                   "total_food":s.get('total_food',0),
                   "start":s['start'].isoformat() if s['start'] else None,
                   "start_ts":s['start'].timestamp() if s['start'] else None,
@@ -657,12 +775,19 @@ def get_tables():
 @app.route("/api/start/<int:tid>", methods=["POST"])
 def start_table(tid):
     d = request.json or {}
+    if tid in active_sessions and active_sessions[tid].get('active'):
+        return jsonify({
+            "status": "error",
+            "msg": f"โต๊ะนี้มีบิลที่ยังเปิดอยู่ (เริ่มเมื่อ {active_sessions[tid]['start'].strftime('%H:%M')}) กรุณาปิดบิลเดิมก่อน"
+        }), 400
     price_mode = d.get('price_mode','') or ''
     if price_mode and price_mode not in PRICE_MODES: price_mode = ''
     cashier = d.get('cashier','ไม่ระบุ')
     sess = {"active":True,"start":datetime.now(),"orders":[],"total_food":0,"limit_mins":0,"note":"","price_mode":price_mode}
+    sess['_gen'] = next_gen()
     active_sessions[tid] = sess
     save_session(tid, sess)
+    trace_session(tid, 'OPEN', sess['_gen'], sess['start'].isoformat(), f"cashier={cashier}")
     send_relay(tid, "on")
     try:
         conn_t = get_db_connection()
@@ -724,6 +849,8 @@ def table_action():
             log_activity('ยกเลิกโต๊ะ', tab_name, detail_txt, cashier)
         except Exception as le2:
             print(f"[WARN] log_activity cancel: {le2}")
+        _popped = active_sessions.get(src, {})
+        trace_session(src, 'CANCEL', _popped.get('_gen'), _popped['start'].isoformat() if _popped.get('start') else None, f"cashier={cashier}")
         active_sessions.pop(src); delete_session(src)
         send_relay(src, 'off')
         now_th = (datetime.now() + TZ_OFFSET).strftime('%H:%M')
@@ -743,24 +870,30 @@ def table_action():
         except Exception as le:
             print(f"[WARN] log_activity move: {le}")
         active_sessions[dst]=active_sessions.pop(src)
+        trace_session(dst, 'MOVE', active_sessions[dst].get('_gen'), active_sessions[dst]['start'].isoformat() if active_sessions[dst].get('start') else None, f"cashier={cashier} (ย้ายจากโต๊ะ id={src})")
         delete_session(src); save_session(dst, active_sessions[dst])
         send_relay(src, 'off')
         send_relay(dst, 'on')
         return jsonify({"status":"success"})
     elif action=='merge' and src in active_sessions and dst in active_sessions:
         cashier = d.get('cashier','ไม่ระบุ')
+        src_type = 'snooker'
         try:
             conn_mg = get_db_connection()
-            src_t = conn_mg.execute("SELECT name FROM tables_config WHERE id=?", (src,)).fetchone()
+            src_t = conn_mg.execute("SELECT name, type FROM tables_config WHERE id=?", (src,)).fetchone()
             dst_t = conn_mg.execute("SELECT name FROM tables_config WHERE id=?", (dst,)).fetchone()
             conn_mg.close()
             src_name = src_t['name'] if src_t else f"โต๊ะ {src}"
             dst_name = dst_t['name'] if dst_t else f"โต๊ะ {dst}"
+            src_type = src_t['type'] if src_t and src_t['type'] else 'snooker'
             log_activity('รวมโต๊ะ', src_name, f"รวมเข้า {dst_name}", cashier)
         except Exception as le:
             print(f"[WARN] log_activity merge: {le}")
-        if active_sessions[src]['start'] and active_sessions[dst]['start']:
+        _old_dst_start = active_sessions[dst]['start'].isoformat() if active_sessions[dst].get('start') else None
+        # *** โต๊ะต้นทางไม่คิดเวลา (เช่น โต๊ะอาหาร/ซื้อกลับ) ไม่ต้องปรับเวลาถอยหลัง เอาแค่รายการอาหารมารวม ***
+        if src_type == 'snooker' and active_sessions[src]['start'] and active_sessions[dst]['start']:
             active_sessions[dst]['start']-=(datetime.now()-active_sessions[src]['start'])
+        trace_session(dst, 'MERGE', active_sessions[dst].get('_gen'), active_sessions[dst]['start'].isoformat() if active_sessions[dst].get('start') else None, f"cashier={cashier} (รวมจากโต๊ะ id={src} type={src_type}, เวลาเดิมก่อนรวม={_old_dst_start})")
         for so in active_sessions[src]['orders']:
             fd=next((d for d in active_sessions[dst]['orders'] if int(d['id'])==int(so['id'])),None)
             if fd: fd['qty']+=so['qty']; fd['total_price']+=so['total_price']
@@ -786,6 +919,7 @@ def checkout():
     try: discounts=conn.execute("SELECT * FROM discount_periods ORDER BY id").fetchall()
     except Exception: discounts=[]
     sess=active_sessions[tid]; fee=0; end=datetime.now()
+    trace_session(tid, 'CHECKOUT', sess.get('_gen'), sess['start'].isoformat() if sess.get('start') else None, f"cashier={cashier}")
     price_mode_in = d.get('price_mode', None)
     price_mode = price_mode_in if price_mode_in is not None else sess.get('price_mode','')
     if price_mode and price_mode not in PRICE_MODES: price_mode = ''
@@ -823,7 +957,7 @@ def checkout():
     conn.commit(); conn.close()
     snap=list(sess['orders']); tsnap=sess['start'].isoformat() if sess['start'] else None
     active_sessions.pop(tid); delete_session(tid)
-    send_relay(tid, 'off')
+    threading.Thread(target=send_relay, args=(tid, 'off'), daemon=True).start()
     try:
         th_start = (datetime.fromisoformat(tsnap) + TZ_OFFSET).strftime('%H:%M') if tsnap else '-'
         th_end   = (end + TZ_OFFSET).strftime('%H:%M')
@@ -875,6 +1009,8 @@ def add_order():
         conn.execute("UPDATE inventory SET stock_qty=stock_qty-1 WHERE id=?",(iid,)); conn.commit()
         if tid not in active_sessions:
             active_sessions[tid]={"active":True,"start":datetime.now(),"orders":[],"total_food":0,"limit_mins":0,"note":"","price_mode":""}
+            active_sessions[tid]['_gen'] = next_gen()
+            trace_session(tid, 'AUTO-OPEN-ORDER', active_sessions[tid]['_gen'], active_sessions[tid]['start'].isoformat(), f"cashier={cashier} (สั่งของทั้งที่โต๊ะยังไม่เปิด!)")
         orders=active_sessions[tid]['orders']
         fd=next((o for o in orders if int(o['id'])==iid),None)
         if fd: fd['qty']+=1; fd['total_price']=fd['qty']*fd['price']
@@ -917,6 +1053,134 @@ def remove_order():
     else: orders.remove(fd)
     save_session(tid, active_sessions[tid])
     return jsonify({"status":"success"})
+
+# ── STOCK CHECK ──────────────────────────────────────────────
+@app.route("/api/stock_check/live")
+def stock_check_live():
+    conn = get_db_connection()
+    rows = conn.execute("SELECT id, product_name, category, stock_qty FROM inventory ORDER BY category, product_name").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/stock_check/save", methods=["POST"])
+def stock_check_save():
+    d = request.json or {}
+    pin = d.get('pin','').strip()
+    items = d.get('items', [])
+    if not pin:
+        return jsonify({"status":"error","msg":"กรุณาใส่รหัสพิน"}),400
+    conn = get_db_connection()
+    emp = conn.execute("SELECT * FROM employees WHERE pin=?", (pin,)).fetchone()
+    if not emp:
+        conn.close()
+        return jsonify({"status":"error","msg":"รหัสพินไม่ถูกต้อง"}),401
+    if not items:
+        conn.close()
+        return jsonify({"status":"error","msg":"ไม่มีรายการที่นับ"}),400
+    now_iso = datetime.now().isoformat()
+    if IS_PG:
+        import psycopg2.extras
+        raw = conn._raw.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        raw.execute("INSERT INTO stock_checks (checked_by,created_at,status) VALUES (%s,%s,'pending') RETURNING id",
+                    (emp['name'], now_iso))
+        check_id = raw.fetchone()['id']
+        for it in items:
+            pos_qty = float(it.get('pos_qty_at_check',0) or 0)
+            actual_qty = float(it.get('actual_qty',0) or 0)
+            diff = actual_qty - pos_qty
+            raw.execute("INSERT INTO stock_check_items (check_id,product_id,product_name,pos_qty_at_check,actual_qty,diff) VALUES (%s,%s,%s,%s,%s,%s)",
+                        (check_id, it.get('product_id'), it.get('product_name',''), pos_qty, actual_qty, diff))
+    else:
+        raw = conn._raw.cursor()
+        raw.execute("INSERT INTO stock_checks (checked_by,created_at,status) VALUES (?,?,'pending')",
+                    (emp['name'], now_iso))
+        check_id = raw.lastrowid
+        for it in items:
+            pos_qty = float(it.get('pos_qty_at_check',0) or 0)
+            actual_qty = float(it.get('actual_qty',0) or 0)
+            diff = actual_qty - pos_qty
+            raw.execute("INSERT INTO stock_check_items (check_id,product_id,product_name,pos_qty_at_check,actual_qty,diff) VALUES (?,?,?,?,?,?)",
+                        (check_id, it.get('product_id'), it.get('product_name',''), pos_qty, actual_qty, diff))
+    conn.commit(); conn.close()
+    try:
+        log_activity('เช็คสต๊อก', '', f"บันทึกรอบเช็คสต๊อก {len(items)} รายการ", emp['name'])
+    except Exception as le:
+        print(f"[WARN] log_activity stock_check: {le}")
+    return jsonify({"status":"success","check_id":check_id,"checked_by":emp['name']})
+
+@app.route("/api/stock_check/history")
+def stock_check_history():
+    conn = get_db_connection()
+    rows = conn.execute("SELECT * FROM stock_checks ORDER BY id DESC").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/stock_check/<int:check_id>")
+def stock_check_detail(check_id):
+    conn = get_db_connection()
+    head = conn.execute("SELECT * FROM stock_checks WHERE id=?", (check_id,)).fetchone()
+    if not head:
+        conn.close()
+        return jsonify({"status":"error","msg":"ไม่พบรอบเช็คสต๊อก"}),404
+    items = conn.execute("SELECT * FROM stock_check_items WHERE check_id=? ORDER BY id", (check_id,)).fetchall()
+    items_out = []
+    for i in items:
+        di = dict(i)
+        cur = None
+        if di.get('product_id'):
+            inv = conn.execute("SELECT stock_qty FROM inventory WHERE id=?", (di['product_id'],)).fetchone()
+            cur = inv['stock_qty'] if inv else None
+        di['current_stock_qty'] = cur
+        items_out.append(di)
+    conn.close()
+    return jsonify({"check": dict(head), "items": items_out})
+
+@app.route("/api/stock_check/<int:check_id>/confirm", methods=["POST"])
+def stock_check_confirm(check_id):
+    d = request.json or {}
+    confirmed_by = d.get('confirmed_by','ไม่ระบุ')
+    conn = get_db_connection()
+    head = conn.execute("SELECT * FROM stock_checks WHERE id=?", (check_id,)).fetchone()
+    if not head:
+        conn.close()
+        return jsonify({"status":"error","msg":"ไม่พบรอบเช็คสต๊อก"}),404
+    if head['status'] == 'confirmed':
+        conn.close()
+        return jsonify({"status":"error","msg":"รอบนี้ถูกยืนยันปรับสต๊อกไปแล้ว"}),400
+    items = conn.execute("SELECT * FROM stock_check_items WHERE check_id=?", (check_id,)).fetchall()
+    for it in items:
+        if it['product_id']:
+            # แก้บัค: เดิมใช้ SET stock_qty = actual_qty (เขียนทับตรงๆ)
+            # ทำให้ยอดขายที่เกิดขึ้นระหว่างช่วงนับสต๊อก -> ยืนยัน หายไปจากสต๊อก
+            # เปลี่ยนเป็นคำนวณส่วนต่างแล้วบวก/ลบแทน ปลอดภัยกว่า ไม่ทับยอดขายที่เกิดขึ้นระหว่างรอยืนยัน
+            diff = it['actual_qty'] - it['pos_qty_at_check']
+            conn.execute("UPDATE inventory SET stock_qty = stock_qty + ? WHERE id=?", (diff, it['product_id']))
+    now_iso = datetime.now().isoformat()
+    conn.execute("UPDATE stock_checks SET status='confirmed', confirmed_by=?, confirmed_at=? WHERE id=?",
+                 (confirmed_by, now_iso, check_id))
+
+    # ── ปิดรอบเก่าที่ยัง "รอยืนยัน" ค้างอยู่ก่อนหน้ารอบนี้ ──
+    # ยึดผลตามรอบล่าสุด (check_id) เท่านั้น รอบเก่าแค่เปลี่ยนสถานะเป็นยืนยันแล้ว
+    # แต่ "ไม่" เอา diff ของรอบเก่ามาปรับสต๊อกซ้ำ (ถูกรอบล่าสุดแทนที่ไปแล้ว)
+    stale = conn.execute(
+        "SELECT id FROM stock_checks WHERE status='pending' AND id<>? AND created_at<=?",
+        (check_id, head['created_at'])
+    ).fetchall()
+    stale_ids = [s['id'] for s in stale]
+    for sid in stale_ids:
+        conn.execute(
+            "UPDATE stock_checks SET status='confirmed', confirmed_by=?, confirmed_at=? WHERE id=?",
+            (confirmed_by + f' (ปิดอัตโนมัติ ถูกแทนที่โดยรอบ #{check_id})', now_iso, sid)
+        )
+
+    conn.commit(); conn.close()
+    try:
+        log_activity('ยืนยันปรับสต๊อก', '', f"ปรับสต๊อกตามรอบเช็ค #{check_id} ({len(items)} รายการ)", confirmed_by)
+        if stale_ids:
+            log_activity('ปิดรอบเช็คสต๊อกค้าง', '', f"ปิดอัตโนมัติ {len(stale_ids)} รอบเก่า (#{', #'.join(map(str,stale_ids))}) ถูกแทนที่โดยรอบ #{check_id}", confirmed_by)
+    except Exception as le:
+        print(f"[WARN] log_activity confirm stock: {le}")
+    return jsonify({"status":"success","adjusted_items":len(items),"auto_closed":stale_ids})
 
 # ── TABLE NOTE ───────────────────────────────────────────────
 @app.route("/api/table/note", methods=["POST"])
@@ -1058,263 +1322,6 @@ def manage_schedule():
 
 # ── AUTO SCHEDULE ─────────────────────────────────────────────
 # ── AUTO SCHEDULE (วันจันทร์ 10,16,18,02 / ศุกร์-เสาร์เบิ้ล 18) ────────────────────────
-@app.route("/api/schedule/auto", methods=["POST"])
-def auto_schedule():
-    """จัดตาราง 4 คน: ทำ 6 หยุด 1 วันจันทร์บังคับกะ 10,16,18,02 วันศุกร์-เสาร์เบิ้ลกะค่ำ"""
-    d = request.json
-    week_start = d['week_start']
-    
-    conn = get_db_connection()
-    all_emps = [r['name'] for r in conn.execute("SELECT name FROM employees WHERE role!='owner' ORDER BY id").fetchall()]
-    shifts = conn.execute("SELECT * FROM work_shifts").fetchall()
-    
-    # 1. ค้นหากะจากเวลาเริ่มต้น (10, 16, 18, 02) -> เลิกใช้ 14.00
-    s_10 = next((s['id'] for s in shifts if s['start_time'] == '10:00'), None)
-    s_16 = next((s['id'] for s in shifts if s['start_time'] == '16:00'), None)
-    s_18 = next((s['id'] for s in shifts if s['start_time'] == '18:00'), None)
-    s_02 = next((s['id'] for s in shifts if s['start_time'] == '02:00'), None)
-    
-    if not (s_10 and s_16 and s_18 and s_02):
-        conn.close()
-        return jsonify({"status":"error", "msg":"กรุณาสร้างกะเวลา 10:00, 16:00, 18:00, 02:00 ให้ครบในเมนูจัดการกะงานก่อนครับ (ส่วนกะ 14:00 กดลบทิ้งได้เลย)"}), 400
-        
-    if len(all_emps) != 4:
-        conn.close()
-        return jsonify({"status":"error", "msg":f"ระบบนี้ออกแบบมาสำหรับ 4 คนเป๊ะๆ (ตอนนี้มี {len(all_emps)} คนในระบบ)"}), 400
-        
-    from datetime import datetime, timedelta
-    start_dt = datetime.strptime(week_start, '%Y-%m-%d')
-    week_num = start_dt.isocalendar()[1]
-    
-    # 2. หมุนเวียนบทบาท ทุกคนจะได้สลับกะและสลับวันหยุดในแต่ละสัปดาห์
-    offset = week_num % 4
-    roles = all_emps[offset:] + all_emps[:offset]
-    R1, R2, R3, R4 = roles[0], roles[1], roles[2], roles[3]
-    
-    # 3. โมเดลตารางงาน (รวม 24 กะ/สัปดาห์)
-    # วันหยุด: R1(อังคาร), R2(พุธ), R3(พฤหัส), R4(อาทิตย์)
-    template = {
-        0: [(R1, s_10), (R2, s_16), (R3, s_18), (R4, s_02)], # จันทร์ (10, 16, 18, 02)
-        1: [(R2, s_16), (R3, s_18), (R4, s_02)],             # อังคาร (R1 หยุด)
-        2: [(R3, s_16), (R4, s_18), (R1, s_02)],             # พุธ (R2 หยุด)
-        3: [(R4, s_16), (R1, s_18), (R2, s_02)],             # พฤหัส (R3 หยุด)
-        4: [(R1, s_16), (R2, s_18), (R3, s_18), (R4, s_02)], # ศุกร์ (เสริมคนกะ 18)
-        5: [(R2, s_16), (R3, s_18), (R4, s_18), (R1, s_02)], # เสาร์ (เสริมคนกะ 18)
-        6: [(R1, s_16), (R2, s_18), (R3, s_02)]              # อาทิตย์ (R4 หยุด)
-    }
-    
-    inserted = 0
-    for day_idx in range(7):
-        date_str = (start_dt + timedelta(days=day_idx)).strftime('%Y-%m-%d')
-        day_shifts = template[day_idx]
-        
-        for emp_name, shift_id in day_shifts:
-            try:
-                from database import IS_PG
-                if IS_PG:
-                    conn.execute("INSERT INTO work_schedule (emp_name,work_date,shift_id,note) VALUES (%s,%s,%s,'auto_v5') ON CONFLICT DO NOTHING", (emp_name, date_str, shift_id))
-                else:
-                    conn.execute("INSERT OR IGNORE INTO work_schedule (emp_name,work_date,shift_id,note) VALUES (?,?,?,'auto_v5')", (emp_name, date_str, shift_id))
-                inserted += 1
-            except: pass
-            
-    conn.commit(); conn.close()
-    return jsonify({"status":"success", "inserted":inserted, "summary":f"จัดตารางเรียบร้อย! จันทร์(10,16,18,02) และทุกคนได้หยุด 1 วัน"})
-
-# ── SHOP SCHEDULE (G2snooker rules) ──────────────────────────
-@app.route("/api/schedule/shop", methods=["POST"])
-def shop_schedule():
-    """จัดตารางตามกฎร้าน G2snooker"""
-    d = request.json or {}
-    week_start   = d.get('week_start')
-    days         = int(d.get('days', 30))
-    no_overwrite = d.get('no_overwrite', False)
-
-    if not week_start:
-        return jsonify({"status":"error","errors":["ไม่ได้ระบุ week_start"]}), 400
-
-    conn = get_db_connection()
-    all_shifts = conn.execute("SELECT * FROM work_shifts ORDER BY start_time").fetchall()
-
-    def find_shift(letter):
-        letter = letter.upper()
-        for s in all_shifts:
-            n = s['shift_name'].upper().replace(' ', '')
-            if f'กะ{letter}' in n or n.endswith(letter):
-                return s
-        return None
-
-    sh_a = find_shift('A')
-    sh_b = find_shift('B')
-    sh_c = find_shift('C')
-    sh_d = find_shift('D')
-    sh_e = find_shift('E')
-
-    all_emps = conn.execute("SELECT * FROM employees").fetchall()
-
-    import unicodedata as _ud
-    def find_emp(*keywords):
-        for e in all_emps:
-            name_n = _ud.normalize('NFC', e['name'])
-            for kw in keywords:
-                if kw and _ud.normalize('NFC', kw) in name_n:
-                    return e
-        return None
-
-    # ดึงชื่อจาก settings ถ้ามี
-    try:
-        sc_settings = {r['setting_key']: r['setting_value'] for r in
-            conn.execute("SELECT setting_key,setting_value FROM system_settings WHERE setting_key LIKE 'sc_emp_%'").fetchall()}
-    except:
-        sc_settings = {}
-    mgr_name   = sc_settings.get('sc_emp_mgr','').strip()
-    rot1_name  = sc_settings.get('sc_emp_rot1','').strip()
-    rot2_name  = sc_settings.get('sc_emp_rot2','').strip()
-    rot3_name  = sc_settings.get('sc_emp_rot3','').strip()
-    fixed_name = sc_settings.get('sc_emp_fixed','').strip()
-    emp_mgr   = find_emp(mgr_name, 'โต๋', 'ผจก', 'ผู้จัดการ') if mgr_name else find_emp('โต๋', 'ผจก')
-    emp_biw   = find_emp(rot1_name, 'บิว') if rot1_name else find_emp('บิว')
-    emp_fern  = find_emp(rot2_name, 'เฟิร์น', 'เฟริน์') if rot2_name else find_emp('เฟิร์น', 'เฟริน์')
-    emp_nadia = find_emp(rot3_name, 'นาเดียร์') if rot3_name else find_emp('นาเดียร์')
-    emp_noy   = find_emp(fixed_name, 'ฟลุ', 'ลุ๊ค') if fixed_name else find_emp('ฟลุ', 'ลุ๊ค')
-
-    errors = []
-    for label, obj in [('กะ A',sh_a),('กะ B',sh_b),('กะ C',sh_c),('กะ D',sh_d),('กะ E',sh_e)]:
-        if not obj: errors.append(f'ไม่พบ {label} ในระบบ — กรุณาสร้างกะก่อน')
-    for label, obj in [('โต๋/ผจก.',emp_mgr),('บิว',emp_biw),(rot2_name or 'เฟิร์น',emp_fern),('นาเดียร์',emp_nadia),(fixed_name or 'ฟลุ๊ค',emp_noy)]:
-        if not obj: errors.append(f'ไม่พบพนักงาน "{label}" — ชื่อต้องตรงกัน')
-    if errors:
-        conn.close()
-        return jsonify({"status":"error","errors":errors}), 400
-
-    from datetime import datetime as dt2
-
-    # รอบ D→C→B (3 วันวนซ้ำ)
-    # อ้างอิง: จันทร์ 20 เม.ย. 2569 = cycle 0
-    REF = dt2(2026, 4, 20)
-    ROTATION = [
-        (sh_d, sh_c, sh_b),  # cycle 0: บิว=D, เฟริน์=C, นาเดียร์=B
-        (sh_c, sh_b, sh_d),  # cycle 1: บิว=C, เฟริน์=B, นาเดียร์=D
-        (sh_b, sh_d, sh_c),  # cycle 2: บิว=B, เฟริน์=D, นาเดียร์=C
-    ]
-    # วันหยุด (weekday 0=จันทร์ ... 6=อาทิตย์)
-    OFF = {
-        emp_mgr['name']:   0,  # จันทร์
-        emp_noy['name']:   3,  # พฤหัส
-        emp_fern['name']:  4,  # ศุกร์
-        emp_nadia['name']: 5,  # เสาร์
-        emp_biw['name']:   6,  # อาทิตย์
-    }
-
-    start_dt = dt2.strptime(week_start, '%Y-%m-%d')
-    existing = set()
-    if no_overwrite:
-        end_str = (start_dt + timedelta(days=days-1)).strftime('%Y-%m-%d')
-        for r in conn.execute(
-            "SELECT emp_name,work_date,shift_id FROM work_schedule WHERE work_date>=? AND work_date<=?",
-            (week_start, end_str)
-        ).fetchall():
-            existing.add((r['emp_name'], r['work_date'], r['shift_id']))
-
-    inserted = 0
-    err_log  = []
-
-    def insert(emp_name, date_str, shift_id):
-        nonlocal inserted
-        if no_overwrite and (emp_name, date_str, shift_id) in existing:
-            return
-        try:
-            if IS_PG:
-                conn.execute(
-                    "INSERT INTO work_schedule (emp_name,work_date,shift_id,note) VALUES (%s,%s,%s,'shop') ON CONFLICT DO NOTHING",
-                    (emp_name, date_str, shift_id))
-            else:
-                conn.execute(
-                    "INSERT OR IGNORE INTO work_schedule (emp_name,work_date,shift_id,note) VALUES (?,?,?,'shop')",
-                    (emp_name, date_str, shift_id))
-            inserted += 1
-        except Exception as e:
-            err_log.append(str(e))
-            print(f'[INSERT ERR] {e}')
-
-    for i in range(days):
-        dt_obj   = start_dt + timedelta(days=i)
-        date_str = dt_obj.strftime('%Y-%m-%d')
-        dow      = dt_obj.weekday()
-        is_mon = (dow == 0)
-        is_thu = (dow == 3)
-        is_fri = (dow == 4)
-
-        cycle = ((dt_obj - REF).days) % 3
-        biw_sh, fern_sh, nadia_sh = ROTATION[cycle]
-
-        # เฟริน์/นาเดียร์ สลับหยุดเสาร์/อาทิตย์
-        week_num = ((dt_obj - REF).days) // 7
-        if week_num % 2 == 0:
-            fern_off_day, nadia_off_day = 5, 6
-        else:
-            fern_off_day, nadia_off_day = 6, 5
-
-        fern_off  = (dow == fern_off_day)
-        nadia_off = (dow == nadia_off_day)
-
-        # วันที่มีคนหยุด 1 คน → ตัดกะ C ออก ใช้ B แทน
-        # วันเสาร์/อาทิตย์ มีคนหยุด 1 คน (เฟริน์หรือนาเดียร์)
-        is_someone_off = fern_off or nadia_off
-
-        def pick_sh(sh):
-            # ถ้าวันนี้มีคนหยุด และกะที่ได้คือ C → เปลี่ยนเป็น B
-            # แต่เฉพาะเมื่อบิวไม่ได้ทำ B อยู่แล้ว (ป้องกันกะซ้ำ)
-            if is_someone_off and sh['id'] == sh_c['id']:
-                if biw_sh['id'] != sh_b['id']:
-                    return sh_b
-            return sh
-
-        # ── โต๋ กะ A (หยุดจันทร์) ───────────────────────────
-        if not is_mon:
-            insert(emp_mgr['name'], date_str, sh_a['id'])
-
-        # ── วันจันทร์: บิวเข้ากะ A แทนโต๋ ──────────────────
-        if is_mon:
-            insert(emp_biw['name'], date_str, sh_a['id'])
-
-        # ── บิว (หยุดศุกร์ ทำ E วันพฤหัส) ──────────────────
-        if is_fri:
-            pass  # บิวหยุดวันศุกร์
-        elif is_thu:
-            # พฤหัสบิวทำกะ E (02:00-10:00)
-            insert(emp_biw['name'], date_str, sh_e['id'])
-        elif not is_mon:
-            # วันอื่นทำกะหมุนเวียน
-            insert(emp_biw['name'], date_str, biw_sh['id'])  # ไม่ pick_sh ป้องกัน duplicate
-        # ── เฟิร์น ────────────────────────────────────────────
-        if not fern_off:
-            sh = pick_sh(fern_sh)
-            if (is_mon and sh['id'] == sh_b['id']) or ((is_thu or is_fri) and sh['id'] == sh_c['id']):
-                insert(emp_fern['name'], date_str, biw_sh['id'])  # ย้ายไปกะของบิว
-            else:
-                insert(emp_fern['name'], date_str, sh['id'])
-        # ── นาเดียร์ ──────────────────────────────────────────
-        if not nadia_off:
-            sh = pick_sh(nadia_sh)
-            if (is_mon and sh['id'] == sh_b['id']) or ((is_thu or is_fri) and sh['id'] == sh_c['id']):
-                insert(emp_nadia['name'], date_str, biw_sh['id'])  # ย้ายไปกะของบิว
-            else:
-                insert(emp_nadia['name'], date_str, sh['id'])
-
-        # ── เจมส์ กะ E (หยุดพฤหัสเท่านั้น) ──────────────────
-        # ศุกร์บิวทำ E แทน แต่เจมส์ก็ทำ E วันศุกร์ได้ด้วย
-        if not is_thu:
-            insert(emp_noy['name'], date_str, sh_e['id'])
-    conn.commit(); conn.close()
-    return jsonify({
-        "status":   "success",
-        "inserted": inserted,
-        "summary":  f"จัด {inserted} slot ใน {days} วัน",
-        "errors":   err_log
-    })
-
-# ── TABLE NAME EDIT ───────────────────────────────────────────
 @app.route("/api/leave_requests", methods=["GET"])
 def get_leave_requests():
     conn = get_db_connection()
@@ -1349,6 +1356,10 @@ def update_leave_request(lid):
                 ON CONFLICT(emp_name,work_date) DO UPDATE SET status='leave',note=EXCLUDED.note""",
                 (req['emp_name'], req['leave_date'],
                  f"ลางาน: {req['reason']} (อนุมัติโดย {approved_by})"))
+            # เมื่ออนุมัติลาแล้ว ต้องลบกะที่ตั้งไว้ล่วงหน้าออกจากตารางเวรของวันนั้นด้วย
+            # ไม่เช่นนั้นกะจะยังค้างโชว์ในตารางจัดเวรทั้งที่อนุมัติลาไปแล้ว
+            conn.execute("DELETE FROM work_schedule WHERE emp_name=? AND work_date=?",
+                (req['emp_name'], req['leave_date']))
         conn.execute("UPDATE leave_requests SET status=?, approved_by=? WHERE id=?",
             (status, approved_by, lid))
         conn.commit()
@@ -1427,9 +1438,13 @@ def send_relay(table_number, state):
             auth={"username": "G2board", "password": "Aa250899"},
             tls={"tls_version": _ssl.PROTOCOL_TLS_CLIENT},
             client_id=f"g2pos-{table_number}",
+            keepalive=15,
         )
+        return True, None
     except Exception as e:
-        print(f"[WARN] Relay MQTT table {table_number}: {e}")
+        err_msg = f"{type(e).__name__}: {e}"
+        print(f"[WARN] Relay MQTT table {table_number}: {err_msg}")
+        return False, err_msg
 
 @app.route("/api/relay/test", methods=["POST"])
 def relay_test():
@@ -1449,8 +1464,11 @@ def relay_control():
     d = request.json
     table = int(d.get("table", 1))
     state = d.get("state", "off")
-    send_relay(table, state)
-    return jsonify({"status":"success","table":table,"state":state})
+    ok, err = send_relay(table, state)
+    if ok:
+        return jsonify({"status":"success","table":table,"state":state})
+    else:
+        return jsonify({"status":"error","table":table,"state":state,"mqtt_error":err}), 500
 
 # ── SPECIAL HOLIDAYS ─────────────────────────────────────────
 @app.route("/api/holidays", methods=["GET","POST","DELETE"])
@@ -1477,29 +1495,6 @@ def manage_holidays():
     conn.close(); return jsonify([dict(r) for r in rows])
 
 # ── EMP SHIFT RESTRICTIONS ────────────────────────────────────
-@app.route("/api/restrictions", methods=["GET","POST","DELETE"])
-def manage_restrictions():
-    conn = get_db_connection()
-    if IS_PG:
-        conn.execute("CREATE TABLE IF NOT EXISTS emp_shift_restrictions (id SERIAL PRIMARY KEY, emp_name TEXT, shift_id INTEGER, UNIQUE(emp_name, shift_id))")
-    else:
-        conn.execute("CREATE TABLE IF NOT EXISTS emp_shift_restrictions (id INTEGER PRIMARY KEY, emp_name TEXT, shift_id INTEGER, UNIQUE(emp_name, shift_id))")
-    conn.commit()
-    if request.method == "POST":
-        d = request.json
-        if IS_PG:
-            conn.execute("INSERT INTO emp_shift_restrictions (emp_name,shift_id) VALUES (?,?) ON CONFLICT DO NOTHING", (d['emp_name'],int(d['shift_id'])))
-        else:
-            conn.execute("INSERT OR IGNORE INTO emp_shift_restrictions (emp_name,shift_id) VALUES (?,?)", (d['emp_name'],int(d['shift_id'])))
-        conn.commit(); conn.close(); return jsonify({"status":"success"})
-    if request.method == "DELETE":
-        d = request.json
-        conn.execute("DELETE FROM emp_shift_restrictions WHERE emp_name=? AND shift_id=?", (d['emp_name'],int(d['shift_id'])))
-        conn.commit(); conn.close(); return jsonify({"status":"success"})
-    rows = conn.execute("SELECT * FROM emp_shift_restrictions").fetchall()
-    conn.close(); return jsonify([dict(r) for r in rows])
-
-# ── CANCEL LOGS ──────────────────────────────────────────────
 @app.route("/api/cancel_logs")
 def get_cancel_logs():
     try:
@@ -1615,6 +1610,196 @@ def get_bill_items(bid):
     bill=conn.execute("SELECT * FROM bills WHERE id=?",(bid,)).fetchone()
     items=conn.execute("SELECT * FROM bill_items WHERE bill_id=?",(bid,)).fetchall()
     conn.close(); return jsonify({"bill":dict(bill) if bill else {},"items":[dict(i) for i in items]})
+
+# ── BILL EDIT / CANCEL (แก้ไข/ยกเลิกบิลย้อนหลัง พร้อมปรับสต๊อกอัตโนมัติ) ──
+@app.route("/api/bills/<int:bid>/edit", methods=["POST"])
+def edit_bill(bid):
+    d = request.json or {}
+    new_items = d.get('items', [])
+    cashier = d.get('cashier', 'ไม่ระบุ')
+    conn = get_db_connection()
+    bill = conn.execute("SELECT * FROM bills WHERE id=?", (bid,)).fetchone()
+    if not bill:
+        conn.close()
+        return jsonify({"status":"error","msg":"ไม่พบบิลนี้"}),404
+    if bill['status'] == 'ยกเลิก':
+        conn.close()
+        return jsonify({"status":"error","msg":"บิลนี้ถูกยกเลิกไปแล้ว แก้ไขไม่ได้"}),400
+    old_items = conn.execute("SELECT * FROM bill_items WHERE bill_id=?", (bid,)).fetchall()
+    old_map = {i['id']: i for i in old_items}
+    change_log = []
+    for it in new_items:
+        iid = it.get('id')
+        old = old_map.get(iid)
+        if not old:
+            continue
+        new_qty = float(it.get('qty', old['qty']))
+        new_price = float(old['price'])  # ราคาห้ามแก้เด็ดขาด ใช้ราคาเดิมเสมอ ไม่สนค่าที่ client ส่งมา
+        delta_qty = new_qty - old['qty']
+        if delta_qty != 0:
+            try:
+                conn.execute("UPDATE inventory SET stock_qty=stock_qty-? WHERE product_name=?", (delta_qty, old['name']))
+            except Exception as se:
+                print(f"[WARN] คืน/ตัดสต๊อกไม่สำเร็จ ({old['name']}): {se}")
+        if new_qty <= 0:
+            conn.execute("DELETE FROM bill_items WHERE id=?", (iid,))
+            change_log.append(f"ลบ {old['name']} x{old['qty']}")
+        else:
+            new_total = round(new_qty * new_price, 2)
+            conn.execute("UPDATE bill_items SET qty=?, price=?, total=? WHERE id=?", (new_qty, new_price, new_total, iid))
+            if new_qty != old['qty']:
+                change_log.append(f"{old['name']}: จำนวน {old['qty']} -> {new_qty}")
+    remaining = conn.execute("SELECT * FROM bill_items WHERE bill_id=?", (bid,)).fetchall()
+    new_food_fee = sum(float(r['total'] or 0) for r in remaining)
+    old_total = float(bill['total'] or 0)
+    new_total = round(float(bill['time_fee'] or 0) + new_food_fee - float(bill['discount'] or 0), 2)
+    conn.execute("UPDATE bills SET food_fee=?, total=? WHERE id=?", (new_food_fee, new_total, bid))
+    conn.commit()
+    try:
+        detail = f"บิล {bill['bill_no']}: ยอดเดิม {old_total:,.2f}฿ -> {new_total:,.2f}฿" + ((" | " + "; ".join(change_log)) if change_log else "")
+        log_activity('แก้ไขบิล', bill['table_name'], detail, cashier)
+    except Exception as le:
+        print(f"[WARN] log_activity edit_bill: {le}")
+    conn.close()
+    return jsonify({"status":"success","new_total":new_total,"new_food_fee":new_food_fee})
+
+@app.route("/api/bills/<int:bid>/cancel", methods=["POST"])
+def cancel_bill(bid):
+    d = request.json or {}
+    cashier = d.get('cashier', 'ไม่ระบุ')
+    conn = get_db_connection()
+    bill = conn.execute("SELECT * FROM bills WHERE id=?", (bid,)).fetchone()
+    if not bill:
+        conn.close()
+        return jsonify({"status":"error","msg":"ไม่พบบิลนี้"}),404
+    if bill['status'] == 'ยกเลิก':
+        conn.close()
+        return jsonify({"status":"error","msg":"บิลนี้ถูกยกเลิกไปแล้ว"}),400
+    items = conn.execute("SELECT * FROM bill_items WHERE bill_id=?", (bid,)).fetchall()
+    for it in items:
+        try:
+            conn.execute("UPDATE inventory SET stock_qty=stock_qty+? WHERE product_name=?", (it['qty'], it['name']))
+        except Exception as se:
+            print(f"[WARN] คืนสต๊อกไม่สำเร็จ ({it['name']}): {se}")
+    conn.execute("UPDATE bills SET status='ยกเลิก' WHERE id=?", (bid,))
+    conn.commit()
+    try:
+        log_activity('ยกเลิกบิล', bill['table_name'], f"บิล {bill['bill_no']} ยอด {float(bill['total'] or 0):,.2f}฿", cashier)
+    except Exception as le:
+        print(f"[WARN] log_activity cancel_bill: {le}")
+    conn.close()
+    return jsonify({"status":"success"})
+
+# ── REPORT RANGE (สรุปย้อนหลังหลายวัน) ─────────────────────
+@app.route("/api/report/bestseller")
+def report_bestseller():
+    start = request.args.get('start', '').strip()
+    end = request.args.get('end', '').strip()
+    conn = get_db_connection()
+    try:
+        q = """SELECT bi.name, SUM(bi.qty) as total_qty, SUM(bi.total) as total_revenue
+               FROM bill_items bi
+               JOIN bills b ON bi.bill_id = b.id
+               WHERE b.status != 'ยกเลิก'"""
+        p = []
+        if start:
+            q += " AND b.created_at >= ?"
+            p.append(start + "T00:00:00")
+        if end:
+            q += " AND b.created_at <= ?"
+            p.append(end + "T23:59:59")
+        q += " GROUP BY bi.name ORDER BY total_qty DESC LIMIT 50"
+        rows = [dict(r) for r in conn.execute(q, p).fetchall()]
+        conn.close()
+        return jsonify(rows)
+    except Exception as e:
+        print(f"[ERROR] report_bestseller: {e}")
+        conn.close()
+        return jsonify([])
+
+@app.route("/api/bills/<int:bid>/restore", methods=["POST"])
+def restore_bill(bid):
+    # *** กู้คืนบิลที่ถูกยกเลิก - ตัดสต๊อกคืน (กลับด้านกับตอนยกเลิก) ***
+    d = request.json or {}
+    cashier = d.get('cashier', 'ไม่ระบุ')
+    conn = get_db_connection()
+    bill = conn.execute("SELECT * FROM bills WHERE id=?", (bid,)).fetchone()
+    if not bill:
+        conn.close()
+        return jsonify({"status":"error","msg":"ไม่พบบิลนี้"}),404
+    if bill['status'] != 'ยกเลิก':
+        conn.close()
+        return jsonify({"status":"error","msg":"บิลนี้ไม่ได้อยู่ในสถานะยกเลิก"}),400
+    items = conn.execute("SELECT * FROM bill_items WHERE bill_id=?", (bid,)).fetchall()
+    for it in items:
+        try:
+            conn.execute("UPDATE inventory SET stock_qty=stock_qty-? WHERE product_name=?", (it['qty'], it['name']))
+        except Exception as se:
+            print(f"[WARN] ตัดสต๊อกคืนไม่สำเร็จ ({it['name']}): {se}")
+    conn.execute("UPDATE bills SET status='ชำระแล้ว' WHERE id=?", (bid,))
+    conn.commit()
+    try:
+        log_activity('กู้คืนบิล', bill['table_name'], f"บิล {bill['bill_no']} ยอด {float(bill['total'] or 0):,.2f}฿", cashier)
+    except Exception as le:
+        print(f"[WARN] log_activity restore_bill: {le}")
+    conn.close()
+    return jsonify({"status":"success"})
+
+@app.route("/api/report/range")
+def report_range():
+    conn = get_db_connection()
+    r1 = conn.execute("SELECT setting_value FROM system_settings WHERE setting_key='day_cutoff_time'").fetchone()
+    ct = r1['setting_value'] if r1 else "06:00"
+    ch, cm = map(int, ct.split(':'))
+    start_str = request.args.get('start', '').strip()
+    end_str = request.args.get('end', '').strip()
+    if not start_str or not end_str:
+        conn.close()
+        return jsonify({"status": "error", "msg": "กรุณาระบุ start และ end"}), 400
+    try:
+        start_d = datetime.strptime(start_str, '%Y-%m-%d')
+        end_d = datetime.strptime(end_str, '%Y-%m-%d')
+    except ValueError:
+        conn.close()
+        return jsonify({"status": "error", "msg": "รูปแบบวันที่ไม่ถูกต้อง"}), 400
+    days = []
+    total_sales = 0.0
+    total_expenses = 0.0
+    cur = start_d
+    while cur <= end_d:
+        ss_th = cur.replace(hour=ch, minute=cm, second=0, microsecond=0)
+        se_th = ss_th + timedelta(days=1)
+        ss = ss_th - TZ_OFFSET
+        se = se_th - TZ_OFFSET
+        sstr = ss.strftime('%Y-%m-%d %H:%M:%S')
+        sestr = se.strftime('%Y-%m-%d %H:%M:%S')
+        bills = conn.execute(
+            "SELECT total FROM bills WHERE created_at>=? AND created_at<? AND status=?",
+            (sstr, sestr, "ชำระแล้ว")
+        ).fetchall()
+        day_sales = sum(float(b['total'] or 0) for b in bills)
+        exp_row = conn.execute(
+            "SELECT SUM(amount) FROM expenses WHERE created_at>=? AND created_at<?",
+            (sstr, sestr)
+        ).fetchone()
+        day_exp = float(exp_row[0]) if exp_row and exp_row[0] else 0.0
+        days.append({
+            "date": cur.strftime('%d/%m/%Y'),
+            "sales": round(day_sales, 2),
+            "expenses": round(day_exp, 2),
+            "net": round(day_sales - day_exp, 2),
+            "bill_count": len(bills),
+        })
+        total_sales += day_sales
+        total_expenses += day_exp
+        cur += timedelta(days=1)
+    conn.close()
+    return jsonify({
+        "days": days,
+        "total_sales": round(total_sales, 2),
+        "total_expenses": round(total_expenses, 2),
+        "total_net": round(total_sales - total_expenses, 2),
+    })
 
 # ── EXPENSES ─────────────────────────────────────────────────
 @app.route("/api/expenses", methods=["GET","POST"])
@@ -1865,11 +2050,15 @@ def payroll_daily():
 @app.route("/api/payroll/weekly_summary", methods=["GET"])
 def payroll_weekly_summary():
     week_start = request.args.get("week_start","")
+    week_end_param = request.args.get("week_end","")
     if not week_start:
         today = datetime.now()
         days_since_mon = today.weekday()
         week_start = (today - timedelta(days=days_since_mon)).strftime("%Y-%m-%d")
-    week_end = (datetime.strptime(week_start,"%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d")
+    if week_end_param:
+        week_end = week_end_param
+    else:
+        week_end = (datetime.strptime(week_start,"%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d")
     conn = get_db_connection()
     rows  = conn.execute(
         "SELECT * FROM payroll_daily WHERE work_date >= ? AND work_date <= ?",
@@ -1977,14 +2166,25 @@ def get_dashboard():
     se=ss+timedelta(days=1)
     sstr=ss.strftime('%Y-%m-%d %H:%M:%S')
     sestr=se.strftime('%Y-%m-%d %H:%M:%S')
-    bills=conn.execute("SELECT * FROM bills WHERE created_at>=? AND created_at<? ORDER BY id DESC",(sstr,sestr)).fetchall()
+    bills=conn.execute("SELECT * FROM bills WHERE created_at>=? AND created_at<? AND status=? ORDER BY id DESC",(sstr,sestr,"ชำระแล้ว")).fetchall()
     sales=sum(b['total'] for b in bills)
     exp=conn.execute("SELECT SUM(amount) FROM expenses WHERE created_at>=? AND created_at<?",(sstr,sestr)).fetchone()[0] or 0
+    rates_p_dash = conn.execute("SELECT * FROM rate_settings").fetchall()
+    sess_rows_dash = conn.execute("SELECT a.table_id, a.start_time, a.total_food, t.type AS ttype FROM active_sessions_db a LEFT JOIN tables_config t ON t.id = a.table_id").fetchall()
+    pending_total = 0.0
+    for s_d in sess_rows_dash:
+        pending_total += float(s_d["total_food"] or 0)
+        if s_d["ttype"] == "snooker" and s_d["start_time"]:
+            try:
+                stt_d = datetime.fromisoformat(s_d["start_time"])
+                pending_total += float(calc_fee(stt_d, datetime.now(), rates_p_dash) or 0)
+            except Exception:
+                pass
     conn.close()
     cash_sales = sum(b['total'] for b in bills if (b.get('payment_method') or 'เงินสด')=='เงินสด')
     transfer_sales = sum(b['total'] for b in bills if (b.get('payment_method') or 'เงินสด')!='เงินสด')
     return jsonify({"sales":round(sales,2),"expenses":round(float(exp),2),"net":round(sales-float(exp),2),
-                    "cash_sales":round(cash_sales,2),"transfer_sales":round(transfer_sales,2),
+                    "cash_sales":round(cash_sales,2),"transfer_sales":round(transfer_sales,2),"pending_total":round(pending_total,2),
                     "shift_date":sd,"starting_cash":sc,"daily_bills":[dict(b) for b in bills]})
     # ── LINE WEBHOOK (ระบบเช็คอินด้วยรูปภาพ) ──────────────────────────────────
 
@@ -2229,6 +2429,19 @@ def line_webhook():
                     shf[kk][0] += 1
                     shf[kk][1] += float(b["total"] or 0)
                 labs = [("A","🌙 ดึก 00-08"),("B","☀️ เช้า 08-16"),("C","🌆 เย็น 16-00")]
+                rates_p_today = conn.execute("SELECT * FROM rate_settings").fetchall()
+                sess_rows_today = conn.execute("SELECT a.table_id, a.start_time, a.total_food, t.type AS ttype FROM active_sessions_db a LEFT JOIN tables_config t ON t.id = a.table_id").fetchall()
+                pend_total_today = 0.0
+                pend_count_today = 0
+                for s_t in sess_rows_today:
+                    pend_count_today += 1
+                    pend_total_today += float(s_t["total_food"] or 0)
+                    if s_t["ttype"] == "snooker" and s_t["start_time"]:
+                        try:
+                            stt_t = datetime.fromisoformat(s_t["start_time"])
+                            pend_total_today += float(calc_fee(stt_t, datetime.now(), rates_p_today) or 0)
+                        except Exception:
+                            pass
                 gt2 = sum(v[1] for v in shf.values()); gb2 = sum(v[0] for v in shf.values())
                 ml = [f"💰 ยอดวันนี้ ({today_str})", "─"*16]
                 for kk, lab in labs:
@@ -2236,7 +2449,10 @@ def line_webhook():
                     ml.append(f"{lab}: {ts2:,.0f} ฿ ({bc2} บิล)")
                 ml.append("─"*16)
                 ml.append(f"รวม: {gt2:,.0f} ฿ ({gb2} บิล)")
-                ml.append("(ยอด ณ ตอนนี้ ยังไม่รวมโต๊ะที่ยังเล่นอยู่)")
+                if pend_count_today > 0:
+                    ml.append(f"⏳ ยอดรอชำระ (ยังเล่นอยู่ {pend_count_today} โต๊ะ): {pend_total_today:,.0f} ฿ (ยังไม่รวมในยอดด้านบน)")
+                else:
+                    ml.append("(ยอด ณ ตอนนี้ ยังไม่รวมโต๊ะที่ยังเล่นอยู่)")
                 reply_msg(reply_token, line_token, "\n".join(ml), show_menu=False)
                 continue
             if text == "พนักงานวันนี้":
@@ -2420,6 +2636,9 @@ def line_webhook():
                                 (approver["name"],req["id"]))
                             conn.execute("INSERT INTO payroll_daily (emp_name,work_date,status,is_late,ot_hours,note) VALUES (?,?,'leave',0,0,?) ON CONFLICT(emp_name,work_date) DO UPDATE SET status='leave',note=EXCLUDED.note",
                                 (req_name,req_date,f"ลางาน: {req['reason']} (อนุมัติโดย {approver['name']})"))
+                            # ลบกะที่ตั้งไว้ล่วงหน้าออกจากตารางเวร ไม่ให้ค้างโชว์หลังอนุมัติลา
+                            conn.execute("DELETE FROM work_schedule WHERE emp_name=? AND work_date=?",
+                                (req_name, req_date))
                             conn.commit()
                             try:
                                 tok = settings.get("line_checkin_token","").strip() or line_token

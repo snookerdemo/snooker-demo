@@ -30,10 +30,11 @@ ALL_PERMISSIONS = [
     ('permissions_manage','จัดการสิทธิ์พนักงาน','พนักงาน'),
     ('settings_manage','ตั้งค่าระบบ (เรท / ตัดกะ)','ระบบ'),
     ('shift_close','ส่งกะ / ปิดจอ','ระบบ'),
+    ('shift_view','ดูตารางงาน / ตารางกะ','พนักงาน'),
 ]
 DEFAULT_STAFF_PERMISSIONS = [
     'table_open','order_remove','bill_history','bill_print',
-    'expense_add','expense_view','exchange','shift_close',
+    'expense_add','expense_view','exchange','shift_close','shift_view',
 ]
 SUPER_ROLES = ('admin','owner')
 
@@ -150,6 +151,8 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS emp_shift_restrictions (id SERIAL PRIMARY KEY, emp_name TEXT, shift_id INTEGER, UNIQUE(emp_name, shift_id))",
             "CREATE TABLE IF NOT EXISTS active_sessions_db (table_id INTEGER PRIMARY KEY, start_time TEXT, orders TEXT DEFAULT '[]', total_food REAL DEFAULT 0, limit_mins INTEGER DEFAULT 0, note TEXT DEFAULT '')",
             "CREATE TABLE IF NOT EXISTS employee_permissions (id SERIAL PRIMARY KEY, emp_id INTEGER NOT NULL, permission_key TEXT NOT NULL, allowed INTEGER DEFAULT 0, UNIQUE(emp_id, permission_key))",
+            "CREATE TABLE IF NOT EXISTS stock_checks (id SERIAL PRIMARY KEY, checked_by TEXT, created_at TEXT, status TEXT DEFAULT 'pending', confirmed_by TEXT, confirmed_at TEXT)",
+            "CREATE TABLE IF NOT EXISTS stock_check_items (id SERIAL PRIMARY KEY, check_id INTEGER, product_id INTEGER, product_name TEXT, pos_qty_at_check REAL, actual_qty REAL, diff REAL)",
         ]
         for s in stmts: cur.execute(s)
         conn.commit()
@@ -211,6 +214,12 @@ def init_db():
             id INTEGER PRIMARY KEY, emp_id INTEGER NOT NULL,
             permission_key TEXT NOT NULL, allowed INTEGER DEFAULT 0,
             UNIQUE(emp_id, permission_key))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS stock_checks (
+            id INTEGER PRIMARY KEY, checked_by TEXT, created_at TEXT,
+            status TEXT DEFAULT 'pending', confirmed_by TEXT, confirmed_at TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS stock_check_items (
+            id INTEGER PRIMARY KEY, check_id INTEGER, product_id INTEGER, product_name TEXT,
+            pos_qty_at_check REAL, actual_qty REAL, diff REAL)''')
         # migration
         raw_cur = conn._raw.cursor()
         existing = [r[1] for r in raw_cur.execute("PRAGMA table_info(payroll)").fetchall()]
